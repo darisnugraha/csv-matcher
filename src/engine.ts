@@ -1,4 +1,5 @@
 import * as XLSX from '@e965/xlsx'
+import { normalizeMatchName as normalize } from './normalize'
 
 export type MatchStatus = 'certain' | 'review' | 'unmatched'
 export type Decision = 'use-json' | 'keep-csv' | 'pending'
@@ -15,6 +16,7 @@ export interface Candidate {
 export interface MatchRow {
   id: string
   sourceIndex: number
+  brand: string
   sourceName: string
   variant: string
   identifier: string
@@ -55,8 +57,9 @@ export interface JsonInfo {
 export type WorkerRequest =
   | { type: 'load-files'; source: File; json: File }
   | { type: 'select-sheet'; sheetName: string }
-  | { type: 'match'; targetIndex: number; variantIndex: number | null; jsonNameField: string; identifierIndex: number | null }
+  | { type: 'match'; targetIndex: number; brandIndex: number | null; variantIndex: number | null; jsonNameField: string; identifierIndex: number | null }
   | { type: 'search'; query: string; rowId: string }
+  | { type: 'recommendations'; rowId: string }
   | { type: 'decide'; rowId: string; decision: Decision; candidateId?: string }
   | { type: 'export' }
   | { type: 'cancel' }
@@ -71,15 +74,12 @@ let masterRecords: Record<string, unknown>[] = []
 let csvInfo: CsvInfo | null = null
 let jsonInfo: JsonInfo | null = null
 let matchRows: MatchRow[] = []
-let mappings: { targetIndex: number; variantIndex: number | null; jsonNameField: string; identifierIndex: number | null } | null = null
+let mappings: { targetIndex: number; brandIndex: number | null; variantIndex: number | null; jsonNameField: string; identifierIndex: number | null } | null = null
+let masterTokenIndex = new Map<string, Set<number>>()
 let canceled = false
 let matchComplete = false
 
 const post = (type: string, payload?: unknown) => self.postMessage({ type, payload })
-
-function normalize(value: string): string {
-  return value.normalize('NFKC').toLocaleUpperCase('id-ID').replace(/[‐‑‒–—−]/g, '-').replace(/\s+/g, ' ').replace(/\s*-\s*/g, ' - ').replace(/[“”]/g, '"').trim()
-}
 
 function tokens(value: string): string[] {
   return normalize(value).replace(/[^A-Z0-9.]+/g, ' ').split(/\s+/).filter(Boolean)
@@ -120,6 +120,16 @@ function levenshtein(a: string, b: string): number {
     prev = cur
   }
   return prev[b.length]
+}
+
+function oneCharacterTypo(left: string, right: string): boolean {
+  if (levenshtein(left, right) === 1) return true
+  if (left.length !== right.length) return false
+  const mismatches = left.split('').flatMap((character, index) => character === right[index] ? [] : [index])
+  return mismatches.length === 2
+    && mismatches[1] === mismatches[0] + 1
+    && left[mismatches[0]] === right[mismatches[1]]
+    && left[mismatches[1]] === right[mismatches[0]]
 }
 
 function similarity(a: string, b: string): number {
@@ -251,9 +261,10 @@ async function loadFiles(sourceFile: File, jsonFile: File) {
   matchComplete = false
   const headers = [...parsedRows[0]]
   const targetGuess = headers.findIndex(field => /items name|nama barang|nama produk/i.test(field))
+  const brandGuess = headers.findIndex(field => field.trim().toLowerCase() === 'category')
   const variantGuess = headers.findIndex(field => /variant name|varian/i.test(field))
   const idGuess = headers.findIndex(field => /sku|internal id|item id/i.test(field))
-  post('files-loaded', { csv: csvInfo, json: jsonInfo, guesses: { targetIndex: targetGuess, variantIndex: variantGuess >= 0 ? variantGuess : null, identifierIndex: idGuess >= 0 ? idGuess : null, jsonNameField: jsonNameGuess } })
+  post('files-loaded', { csv: csvInfo, json: jsonInfo, guesses: { targetIndex: targetGuess, brandIndex: brandGuess >= 0 ? brandGuess : null, variantIndex: variantGuess >= 0 ? variantGuess : null, identifierIndex: idGuess >= 0 ? idGuess : null, jsonNameField: jsonNameGuess } })
 }
 
 function selectSourceSheet(sheetName: string) {
@@ -266,10 +277,11 @@ function selectSourceSheet(sheetName: string) {
   mappings = null
   csvInfo = { ...csvInfo, selectedSheet, rows: sourceRows.length - 1, columns: sourceRows[0].length, headers: [...sourceRows[0]], preview: sourceRows.slice(0, 5) }
   const targetGuess = sourceRows[0].findIndex(field => /items name|nama barang|nama produk/i.test(field))
+  const brandGuess = sourceRows[0].findIndex(field => field.trim().toLowerCase() === 'category')
   const variantGuess = sourceRows[0].findIndex(field => /variant name|varian/i.test(field))
   const idGuess = sourceRows[0].findIndex(field => /sku|internal id|item id/i.test(field))
   const jsonNameGuess = jsonInfo.fields.find(field => field.toLowerCase() === 'nama_barang') ?? jsonInfo.fields.find(field => /nama.*barang|product.*name/i.test(field)) ?? ''
-  post('files-loaded', { csv: csvInfo, json: jsonInfo, guesses: { targetIndex: targetGuess, variantIndex: variantGuess >= 0 ? variantGuess : null, identifierIndex: idGuess >= 0 ? idGuess : null, jsonNameField: jsonNameGuess } })
+  post('files-loaded', { csv: csvInfo, json: jsonInfo, guesses: { targetIndex: targetGuess, brandIndex: brandGuess >= 0 ? brandGuess : null, variantIndex: variantGuess >= 0 ? variantGuess : null, identifierIndex: idGuess >= 0 ? idGuess : null, jsonNameField: jsonNameGuess } })
 }
 
 function splitName(value: string): { base: string; variant: string } {
@@ -278,13 +290,52 @@ function splitName(value: string): { base: string; variant: string } {
   return splitAt >= 0 ? { base: name.slice(0, splitAt), variant: name.slice(splitAt + 3) } : { base: name, variant: '' }
 }
 
+function hasOneWordDifference(leftValue: string, rightValue: string): boolean {
+  const left = tokens(leftValue)
+  const right = tokens(rightValue)
+  if (left.length === right.length) {
+    const differences = left.map((token, index) => token === right[index] ? -1 : index).filter(index => index >= 0)
+    if (differences.length === 0) return true
+    if (differences.length === 1) {
+      const index = differences[0]
+      return left[index].length >= 4 && right[index].length >= 4 && oneCharacterTypo(left[index], right[index])
+    }
+    return false
+  }
+  if (Math.abs(left.length - right.length) !== 1) return false
+  const longer = left.length > right.length ? left : right
+  const shorter = left.length > right.length ? right : left
+  for (let skipped = 0; skipped < longer.length; skipped += 1) {
+    if (!/^[A-Z]+$/.test(longer[skipped])) continue
+    if (longer.filter((_, index) => index !== skipped).every((token, index) => token === shorter[index])) return true
+  }
+  return false
+}
+
+function sameSpecifications(left: string, right: string): boolean {
+  const leftSpecs = [...specs(left)].sort()
+  const rightSpecs = [...specs(right)].sort()
+  return leftSpecs.length === rightSpecs.length && leftSpecs.every((spec, index) => spec === rightSpecs[index])
+}
+
+function isCertainCandidate(brand: string, sourceName: string, variant: string, candidate: Candidate): boolean {
+  const sourceBase = [brand, sourceName].filter(Boolean).join(' ')
+  const target = splitName(candidate.name)
+  const sourceFull = [sourceBase, variant].filter(Boolean).join(' - ')
+  return !candidate.specConflict
+    && normalize(variant) === normalize(target.variant)
+    && sameSpecifications(sourceFull, candidate.name)
+    && hasOneWordDifference(sourceBase, target.base)
+}
+
 function masterName(record: Record<string, unknown>, field: string): string {
   return typeof record[field] === 'string' ? record[field] as string : ''
 }
 
-function candidatesFor(sourceName: string, variant: string, field: string, tokenIndex: Map<string, Set<number>>): Candidate[] {
-  const full = normalize([sourceName, variant].filter(Boolean).join(' - '))
-  const queryTokens = [...new Set(tokens(`${sourceName} ${variant}`))].sort((a, b) => (tokenIndex.get(a)?.size ?? 0) - (tokenIndex.get(b)?.size ?? 0))
+function candidatesFor(sourceName: string, variant: string, field: string, tokenIndex: Map<string, Set<number>>, brand = ''): Candidate[] {
+  const baseName = [brand, sourceName].filter(Boolean).join(' ')
+  const full = normalize([baseName, variant].filter(Boolean).join(' - '))
+  const queryTokens = [...new Set(tokens(`${baseName} ${variant}`))].sort((a, b) => (tokenIndex.get(a)?.size ?? 0) - (tokenIndex.get(b)?.size ?? 0))
   const pool = new Set<number>()
   for (const token of queryTokens) {
     for (const id of tokenIndex.get(token) ?? []) {
@@ -309,9 +360,9 @@ function candidatesFor(sourceName: string, variant: string, field: string, token
     const name = masterName(record, field)
     const parts = splitName(name)
     let score = similarity(full, name)
-    if (variant) score = Math.round(similarity(sourceName, parts.base) * 0.6 + similarity(variant, parts.variant || name) * 0.4)
+    if (variant) score = Math.round(similarity(baseName, parts.base) * 0.6 + similarity(variant, parts.variant || name) * 0.4)
     const context = ['kode_varian', 'jenis_varian'].map(key => typeof record[key] === 'string' ? record[key] as string : '').filter(Boolean).join(' ')
-    const conflict = conflicts(`${sourceName} ${variant}`, `${name} ${context}`)
+    const conflict = conflicts(`${baseName} ${variant}`, `${name} ${context}`)
     return { index, name, score, conflict }
   }).filter(item => item.name).sort((a, b) => b.score - a.score || a.name.localeCompare(b.name, 'id') || a.index - b.index)
   const deduped: Candidate[] = []
@@ -330,12 +381,33 @@ function candidatesFor(sourceName: string, variant: string, field: string, token
     }
     const record = masterRecords[item.index]
     const context = ['kode_varian', 'jenis_varian'].map(key => typeof record[key] === 'string' ? record[key] as string : '').filter(Boolean).join(' ')
-    const specConflict = conflicts(`${sourceName} ${variant}`, `${item.name} ${context}`)
+    const specConflict = conflicts(`${baseName} ${variant}`, `${item.name} ${context}`)
     const candidate = { id: recordRef(record, item.index), name: item.name, score: item.score, refs: [recordRef(record, item.index)], reason, specConflict }
     byName.set(key, candidate)
     deduped.push(candidate)
   }
-  return deduped.slice(0, 3)
+  return deduped
+}
+
+function mergeCandidates(...candidateLists: Candidate[][]): Candidate[] {
+  const merged = new Map<string, Candidate>()
+  for (const candidate of candidateLists.flat()) {
+    const key = normalize(candidate.name)
+    const existing = merged.get(key)
+    if (!existing) {
+      merged.set(key, { ...candidate, refs: [...candidate.refs] })
+      continue
+    }
+    existing.refs = [...new Set([...existing.refs, ...candidate.refs])]
+    existing.specConflict = Boolean(existing.specConflict || candidate.specConflict)
+    if (candidate.score > existing.score) {
+      existing.score = candidate.score
+      existing.id = candidate.id
+      existing.reason = candidate.reason
+    }
+    if (existing.specConflict) existing.reason = 'Periksa perbedaan angka atau spesifikasi.'
+  }
+  return [...merged.values()].sort((a, b) => b.score - a.score || a.name.localeCompare(b.name, 'id'))
 }
 
 function trigrams(value: string): string[] {
@@ -348,7 +420,9 @@ function trigrams(value: string): string[] {
 async function runMatch(config: NonNullable<typeof mappings>) {
   if (!csvInfo || !jsonInfo) throw new Error('Unggah kedua file terlebih dahulu.')
   if (config.targetIndex < 0 || config.targetIndex >= csvInfo.columns) throw new Error('Mapping kolom nama CSV wajib dipilih.')
+  if (config.brandIndex != null && (config.brandIndex < 0 || config.brandIndex >= csvInfo.columns)) throw new Error('Mapping kolom merek tidak valid. Pilih kolom merek yang tersedia.')
   if (config.variantIndex === config.targetIndex) throw new Error('Kolom varian harus berbeda dari kolom nama barang.')
+  if (config.brandIndex != null && (config.brandIndex === config.targetIndex || config.brandIndex === config.variantIndex)) throw new Error('Kolom merek harus berbeda dari kolom nama barang dan varian.')
   if (!config.jsonNameField) throw new Error('Field nama JSON wajib dipilih.')
   mappings = config
   canceled = false
@@ -356,6 +430,7 @@ async function runMatch(config: NonNullable<typeof mappings>) {
   matchComplete = false
   post('progress', { stage: 'Membangun indeks master…', value: 10 })
   const tokenIndex = new Map<string, Set<number>>()
+  masterTokenIndex = tokenIndex
   masterRecords.forEach((record, index) => {
     if (index % 1000 === 0 && canceled) return
     const name = masterName(record, config.jsonNameField)
@@ -373,23 +448,40 @@ async function runMatch(config: NonNullable<typeof mappings>) {
   for (let index = 0; index < rows.length; index += 1) {
     if (canceled) { post('canceled'); return }
     const cells = rows[index]
+    const brand = config.brandIndex == null ? '' : cells[config.brandIndex] ?? ''
     const sourceName = cells[config.targetIndex] ?? ''
     const variant = config.variantIndex == null ? '' : cells[config.variantIndex] ?? ''
     const id = `${csvInfo.fileName}:${index + 2}`
     const identifier = config.identifierIndex == null ? '' : cells[config.identifierIndex] ?? ''
     if (!sourceName.trim()) {
-      matchRows.push({ id, sourceIndex: index, sourceName, variant, identifier, status: 'unmatched', reason: 'Nama CSV kosong; baris dipertahankan.', candidates: [], decision: 'pending', finalName: sourceName })
+      matchRows.push({ id, sourceIndex: index, brand, sourceName, variant, identifier, status: 'unmatched', reason: 'Nama CSV kosong; baris dipertahankan.', candidates: [], decision: 'pending', finalName: sourceName })
     } else {
-      const found = candidatesFor(sourceName, variant, config.jsonNameField, tokenIndex).filter(candidate => candidate.score >= 80)
-      const perfectCandidates = found.filter(candidate => candidate.score === 100)
-      const automatic = perfectCandidates.length === 1
-      const selectedCandidate = automatic ? perfectCandidates[0] : undefined
+      const primary = candidatesFor(sourceName, variant, config.jsonNameField, tokenIndex)
+      const brandAware = brand.trim() ? candidatesFor(sourceName, variant, config.jsonNameField, tokenIndex, brand.trim()) : []
+      const merged = mergeCandidates(primary, brandAware)
+      const certainCandidates = merged.filter(candidate => isCertainCandidate(brand.trim(), sourceName, variant, candidate))
+      // A unique perfect displayed score is decisive, even if metadata flags a
+      // specification conflict. Distinct names tied at 100% remain ambiguous.
+      const perfectCandidates = merged.filter(candidate => candidate.score === 100)
+      const selectedCandidate = perfectCandidates.length === 1
+        ? perfectCandidates[0]
+        : perfectCandidates.length > 1
+          ? undefined
+          : certainCandidates.length === 1 ? certainCandidates[0] : undefined
+      const automatic = Boolean(selectedCandidate)
+      const recommended = merged.filter(candidate => candidate.score >= 80 || certainCandidates.includes(candidate))
+      const found = selectedCandidate
+        ? [selectedCandidate, ...recommended.filter(candidate => normalize(candidate.name) !== normalize(selectedCandidate.name))].slice(0, 3)
+        : recommended.slice(0, 3)
       const reason = automatic
-        ? selectedCandidate?.specConflict
-          ? 'Skor kemiripan 100%; dipilih otomatis. Metadata menunjukkan konflik spesifikasi.'
-          : 'Skor kemiripan 100%; satu nama target unik dipilih otomatis.'
-        : found.length ? found[0].reason : 'Kandidat tidak ditemukan. Cari nama di seluruh master.'
-      matchRows.push({ id, sourceIndex: index, sourceName, variant, identifier, status: automatic ? 'certain' : found.length ? 'review' : 'unmatched', reason, candidates: found, decision: automatic ? 'use-json' : 'pending', chosenId: selectedCandidate?.id, finalName: selectedCandidate?.name ?? sourceName })
+        ? perfectCandidates.length === 1
+          ? 'Satu nama master unik mendapat skor 100% dan dipilih otomatis.'
+          : 'Varian dan spesifikasi cocok; satu nama master dengan perbedaan maksimal satu kata dipilih otomatis.'
+        : found.length ? perfectCandidates.length > 1
+          ? 'Beberapa nama master berbeda mendapat skor 100%. Pilih kandidat secara manual.'
+          : certainCandidates.length > 1 ? 'Beberapa nama master memiliki varian dan spesifikasi yang cocok. Pilih kandidat secara manual.' : found[0].reason
+          : 'Kandidat tidak ditemukan. Cari nama di seluruh master.'
+      matchRows.push({ id, sourceIndex: index, brand, sourceName, variant, identifier, status: automatic ? 'certain' : found.length ? 'review' : 'unmatched', reason, candidates: found, decision: automatic ? 'use-json' : 'pending', chosenId: selectedCandidate?.id, finalName: selectedCandidate?.name ?? sourceName })
     }
     if (index % 250 === 0 || index === rows.length - 1) {
       post('progress', { stage: `Mencocokkan record ${index + 1} dari ${rows.length}…`, value: 20 + Math.round((index + 1) / rows.length * 75) })
@@ -449,6 +541,33 @@ function searchMaster(query: string, rowId: string) {
     }
   }
   post('search-results', { rowId, results: found })
+}
+
+function updateRecommendations(rowId: string) {
+  if (!mappings) return
+  const row = matchRows.find(item => item.id === rowId)
+  if (!row) return
+  const merged = mergeCandidates(
+    candidatesFor(row.sourceName, row.variant, mappings.jsonNameField, masterTokenIndex),
+    row.brand.trim() ? candidatesFor(row.sourceName, row.variant, mappings.jsonNameField, masterTokenIndex, row.brand.trim()) : [],
+  )
+  const certainCandidates = merged.filter(candidate => isCertainCandidate(row.brand.trim(), row.sourceName, row.variant, candidate))
+  const eligible = merged.filter(candidate => candidate.score >= 80 || certainCandidates.includes(candidate))
+  const usedNames = new Set(matchRows
+    .filter(other => other.id !== row.id && other.decision === 'use-json')
+    .map(other => normalize(other.finalName)))
+  const available = eligible.filter(candidate => !usedNames.has(normalize(candidate.name)))
+  const hiddenCount = eligible.filter(candidate => usedNames.has(normalize(candidate.name))
+    && !(row.decision === 'use-json' && normalize(candidate.name) === normalize(row.finalName))).length
+  const selectedCandidate = row.decision === 'use-json'
+    ? row.candidates.find(candidate => candidate.id === row.chosenId)
+      ?? merged.find(candidate => normalize(candidate.name) === normalize(row.finalName))
+    : undefined
+  const suggestions = selectedCandidate
+    ? [selectedCandidate, ...available.filter(candidate => normalize(candidate.name) !== normalize(selectedCandidate.name))].slice(0, 3)
+    : available.slice(0, 3)
+  row.candidates = suggestions
+  post('recommendations-updated', { rowId, candidates: suggestions, hiddenCount })
 }
 
 function decide(rowId: string, decision: Decision, candidateId?: string) {
@@ -540,10 +659,10 @@ function exportFiles() {
     mainContent = (csvInfo.bom ? '\uFEFF' : '') + outputTextNoBom
     fileName = `${csvInfo.fileName.replace(/\.csv$/i, '')}_cocok_pasti.csv`
   }
-  const reportHeaders = ['Nomor record sumber', 'ID atau SKU', 'Nama CSV', 'Varian CSV', 'Referensi JSON', 'Kandidat', 'Skor', 'Metode', 'Alasan', 'Keputusan', 'Nama akhir']
+  const reportHeaders = ['Nomor record sumber', 'ID atau SKU', 'Merek CSV', 'Nama CSV', 'Varian CSV', 'Referensi JSON', 'Kandidat', 'Skor', 'Metode', 'Alasan', 'Keputusan', 'Nama akhir']
   const report = [reportHeaders, ...matchRows.map(row => {
     const reportCandidate = row.candidates.find(c => c.id === row.chosenId) ?? row.candidates[0]
-    return [String(row.sourceIndex + 2), row.identifier, row.sourceName, row.variant, reportCandidate?.refs.join('; ') ?? '', reportCandidate?.name ?? '', String(reportCandidate?.score ?? ''), row.status === 'certain' ? 'Nama tepat' : row.status === 'review' ? 'Fuzzy / tinjauan' : 'Tidak cocok', row.reason, row.decision === 'use-json' ? 'Gunakan JSON' : row.decision === 'keep-csv' ? 'Pertahankan CSV' : 'Belum dipilih', row.finalName]
+    return [String(row.sourceIndex + 2), row.identifier, row.brand, row.sourceName, row.variant, reportCandidate?.refs.join('; ') ?? '', reportCandidate?.name ?? '', String(reportCandidate?.score ?? ''), row.status === 'certain' ? 'Cocok pasti (varian/spec cocok)' : row.status === 'review' ? 'Fuzzy / tinjauan' : 'Tidak cocok', row.reason, row.decision === 'use-json' ? 'Gunakan JSON' : row.decision === 'keep-csv' ? 'Pertahankan CSV' : 'Belum dipilih', row.finalName]
   })]
   const reportText = serialize(report, ',', '\r\n', false)
   const exportSummary = {
@@ -562,12 +681,13 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
   try {
     if (message.type === 'load-files') await loadFiles(message.source, message.json)
     if (message.type === 'select-sheet') selectSourceSheet(message.sheetName)
-    if (message.type === 'match') await runMatch({ targetIndex: message.targetIndex, variantIndex: message.variantIndex, jsonNameField: message.jsonNameField, identifierIndex: message.identifierIndex })
+    if (message.type === 'match') await runMatch({ targetIndex: message.targetIndex, brandIndex: message.brandIndex, variantIndex: message.variantIndex, jsonNameField: message.jsonNameField, identifierIndex: message.identifierIndex })
     if (message.type === 'search') searchMaster(message.query, message.rowId)
+    if (message.type === 'recommendations') updateRecommendations(message.rowId)
     if (message.type === 'decide') decide(message.rowId, message.decision, message.candidateId)
     if (message.type === 'export') exportFiles()
     if (message.type === 'cancel') { canceled = true; matchComplete = false; post('canceled') }
-    if (message.type === 'reset') { sourceRows = []; masterRecords = []; sourceWorkbook = null; sourceSheetNames = []; selectedSheet = ''; csvInfo = null; jsonInfo = null; matchRows = []; mappings = null; matchComplete = false; canceled = true; post('reset') }
+    if (message.type === 'reset') { sourceRows = []; masterRecords = []; masterTokenIndex = new Map(); sourceWorkbook = null; sourceSheetNames = []; selectedSheet = ''; csvInfo = null; jsonInfo = null; matchRows = []; mappings = null; matchComplete = false; canceled = true; post('reset') }
   } catch (error) {
     post('error', { message: error instanceof Error ? error.message : 'Terjadi kesalahan saat memproses file.' })
   }
