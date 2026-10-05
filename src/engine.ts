@@ -1,3 +1,5 @@
+import * as XLSX from '@e965/xlsx'
+
 export type MatchStatus = 'certain' | 'review' | 'unmatched'
 export type Decision = 'use-json' | 'keep-csv' | 'pending'
 
@@ -25,6 +27,7 @@ export interface MatchRow {
 }
 
 export interface CsvInfo {
+  format: 'csv' | 'xlsx'
   fileName: string
   bytes: number
   rows: number
@@ -36,6 +39,8 @@ export interface CsvInfo {
   trailingNewline: boolean
   preview: string[][]
   warnings: string[]
+  sheetNames: string[]
+  selectedSheet: string
 }
 
 export interface JsonInfo {
@@ -48,7 +53,8 @@ export interface JsonInfo {
 }
 
 export type WorkerRequest =
-  | { type: 'load-files'; csv: File; json: File }
+  | { type: 'load-files'; source: File; json: File }
+  | { type: 'select-sheet'; sheetName: string }
   | { type: 'match'; targetIndex: number; variantIndex: number | null; jsonNameField: string; identifierIndex: number | null }
   | { type: 'search'; query: string; rowId: string }
   | { type: 'decide'; rowId: string; decision: Decision; candidateId?: string }
@@ -57,6 +63,10 @@ export type WorkerRequest =
   | { type: 'reset' }
 
 let sourceRows: string[][] = []
+let sourceFormat: 'csv' | 'xlsx' = 'csv'
+let sourceSheetNames: string[] = []
+let selectedSheet = ''
+let sourceWorkbook: XLSX.WorkBook | null = null
 let masterRecords: Record<string, unknown>[] = []
 let csvInfo: CsvInfo | null = null
 let jsonInfo: JsonInfo | null = null
@@ -136,7 +146,7 @@ function detectCsvDelimiter(text: string): string {
 }
 
 async function decodeFile(file: File): Promise<{ text: string; bytes: number }> {
-  if (file.size > (file.name.toLowerCase().endsWith('.csv') ? 10 : 50) * 1024 * 1024) throw new Error(file.name.toLowerCase().endsWith('.csv') ? 'Ukuran CSV melebihi batas 10 MB.' : 'Ukuran JSON melebihi batas 50 MB.')
+  if (file.size > (file.name.toLowerCase().endsWith('.json') ? 50 : 10) * 1024 * 1024) throw new Error(file.name.toLowerCase().endsWith('.json') ? 'Ukuran JSON melebihi batas 50 MB.' : 'Ukuran file sumber melebihi batas 10 MB.')
   const buffer = await file.arrayBuffer()
   try {
     const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buffer)
@@ -146,30 +156,74 @@ async function decodeFile(file: File): Promise<{ text: string; bytes: number }> 
   }
 }
 
-async function loadFiles(csvFile: File, jsonFile: File) {
+function parseXlsxSheet(sheetName: string): string[][] {
+  if (!sourceWorkbook || !sourceWorkbook.Sheets[sheetName]) throw new Error('Sheet XLSX yang dipilih tidak ditemukan. Pilih sheet lain atau unggah ulang workbook.')
+  const worksheet = sourceWorkbook.Sheets[sheetName]
+  const values = XLSX.utils.sheet_to_json<unknown[]>(worksheet, { header: 1, raw: false, defval: '', blankrows: true })
+  const range = worksheet['!ref'] ? XLSX.utils.decode_range(worksheet['!ref'] as string) : null
+  const width = Math.max(range ? range.e.c + 1 : 0, ...values.map(row => row.length))
+  if (values.length - 1 > 20_000) throw new Error('Sheet XLSX melebihi batas 20.000 record. Pilih sheet yang lebih kecil atau kurangi jumlah baris.')
+  if (!values.length || !values[0]?.some(value => String(value ?? '').trim())) throw new Error('Sheet XLSX harus memiliki header pada baris pertama.')
+  if (width === 0) throw new Error('Sheet XLSX yang dipilih tidak memiliki kolom data.')
+  return values.map(row => Array.from({ length: width }, (_, index) => {
+    const value = row[index]
+    return value == null ? '' : String(value)
+  }))
+}
+
+async function loadFiles(sourceFile: File, jsonFile: File) {
   canceled = false
-  if (!csvFile.name.toLowerCase().endsWith('.csv')) throw new Error('Pilih file sumber dengan ekstensi .csv.')
+  const lowerName = sourceFile.name.toLowerCase()
+  if (!lowerName.endsWith('.csv') && !lowerName.endsWith('.xlsx')) throw new Error('Pilih file sumber dengan ekstensi .csv atau .xlsx.')
   if (!jsonFile.name.toLowerCase().endsWith('.json')) throw new Error('Pilih master barang dengan ekstensi .json.')
-  post('progress', { stage: 'Membaca CSV dan JSON…', value: 5 })
-  const [csvDecoded, jsonDecoded] = await Promise.all([decodeFile(csvFile), decodeFile(jsonFile)])
+  if (sourceFile.size > 10 * 1024 * 1024) throw new Error('Ukuran file sumber melebihi batas 10 MB.')
+  post('progress', { stage: `Membaca ${lowerName.endsWith('.xlsx') ? 'XLSX' : 'CSV'} dan JSON…`, value: 5 })
+  const [sourceDecoded, jsonDecoded] = await Promise.all([sourceFile.arrayBuffer().then(buffer => ({ buffer, bytes: buffer.byteLength })), decodeFile(jsonFile)])
   if (canceled) return
-  const bom = csvDecoded.text.charCodeAt(0) === 0xfeff
-  const csvText = bom ? csvDecoded.text.slice(1) : csvDecoded.text
-  const delimiter = detectCsvDelimiter(csvText)
+  sourceFormat = lowerName.endsWith('.xlsx') ? 'xlsx' : 'csv'
+  sourceWorkbook = null
+  sourceSheetNames = []
+  selectedSheet = ''
   post('progress', { stage: 'Memvalidasi struktur file…', value: 18 })
-  const parsedCsv = Papa.parse<string[]>(csvText, { delimiter, header: false, dynamicTyping: false, skipEmptyLines: false, quoteChar: '"', escapeChar: '"' })
-  if (parsedCsv.errors.length) {
-    const error = parsedCsv.errors[0]
-    throw new Error(`CSV tidak dapat dibaca di baris ${typeof error.row === 'number' ? error.row + 1 : '?'}: ${error.message}`)
+  let parsedRows: string[][]
+  let bom = false
+  let delimiter = ''
+  let linebreak = ''
+  let trailingNewline = false
+  if (sourceFormat === 'xlsx') {
+    try {
+      sourceWorkbook = XLSX.read(sourceDecoded.buffer, { type: 'array', cellDates: false, cellFormula: true })
+    } catch {
+      throw new Error('XLSX tidak dapat dibaca. Pastikan workbook tidak rusak atau dienkripsi, lalu unggah kembali.')
+    }
+    sourceSheetNames = sourceWorkbook.SheetNames
+    if (!sourceSheetNames.length) throw new Error('Workbook XLSX tidak memiliki sheet. Tambahkan sheet dengan header, lalu unggah kembali.')
+    selectedSheet = sourceSheetNames[0]
+    parsedRows = parseXlsxSheet(selectedSheet)
+  } else {
+    let sourceText: string
+    try { sourceText = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(sourceDecoded.buffer) } catch {
+      throw new Error(`File ${sourceFile.name} bukan UTF-8 yang valid. Simpan ulang file sebagai UTF-8, lalu unggah kembali.`)
+    }
+    bom = sourceText.charCodeAt(0) === 0xfeff
+    const csvText = bom ? sourceText.slice(1) : sourceText
+    delimiter = detectCsvDelimiter(csvText)
+    const parsedCsv = Papa.parse<string[]>(csvText, { delimiter, header: false, dynamicTyping: false, skipEmptyLines: false, quoteChar: '"', escapeChar: '"' })
+    if (parsedCsv.errors.length) {
+      const error = parsedCsv.errors[0]
+      throw new Error(`CSV tidak dapat dibaca di baris ${typeof error.row === 'number' ? error.row + 1 : '?'}: ${error.message}`)
+    }
+    parsedRows = parsedCsv.data
+    if (parsedRows.length < 1 || !parsedRows[0]?.some(value => value.trim())) throw new Error('CSV harus berisi header.')
+    const width = parsedRows[0].length
+    if (parsedRows.some(row => row.length !== width && row.some(value => value !== ''))) {
+      const bad = parsedRows.findIndex(row => row.length !== width && row.some(value => value !== ''))
+      throw new Error(`Jumlah kolom tidak sesuai di record ${bad + 1}. Periksa pemisah dan kutipan pada baris tersebut.`)
+    }
+    if (parsedRows.length - 1 > 20_000) throw new Error('CSV melebihi batas 20.000 record. Gunakan file yang lebih kecil.')
+    linebreak = parsedCsv.meta.linebreak || (csvText.includes('\r\n') ? '\r\n' : '\n')
+    trailingNewline = /(?:\r\n|\n|\r)$/.test(csvText)
   }
-  const parsedRows = parsedCsv.data
-  if (parsedRows.length < 1 || !parsedRows[0]?.some(value => value.trim())) throw new Error('CSV harus berisi header.')
-  const width = parsedRows[0].length
-  if (parsedRows.some(row => row.length !== width && row.some(value => value !== ''))) {
-    const bad = parsedRows.findIndex(row => row.length !== width && row.some(value => value !== ''))
-    throw new Error(`Jumlah kolom tidak sesuai di record ${bad + 1}. Periksa pemisah dan kutipan pada baris tersebut.`)
-  }
-  if (parsedRows.length - 1 > 20_000) throw new Error('CSV melebihi batas 20.000 record. Gunakan file yang lebih kecil.')
   const jsonText = jsonDecoded.text.replace(/^\uFEFF/, '')
   let parsedJson: unknown
   try { parsedJson = JSON.parse(jsonText) } catch (error) {
@@ -183,19 +237,38 @@ async function loadFiles(csvFile: File, jsonFile: File) {
   masterRecords = parsedJson as Record<string, unknown>[]
   matchRows = []
   matchComplete = false
-  const headers = [...parsedRows[0]]
+  if (parsedRows.length - 1 > 20_000) throw new Error(`${sourceFormat.toUpperCase()} melebihi batas 20.000 record. Pilih sheet yang lebih kecil atau gunakan file yang lebih kecil.`)
   const fields = [...new Set(masterRecords.flatMap(item => Object.keys(item)))].sort()
   const jsonNameGuess = fields.find(field => field.toLowerCase() === 'nama_barang') ?? fields.find(field => /nama.*barang|product.*name/i.test(field)) ?? ''
-  const targetGuess = headers.findIndex(field => /items name|nama barang|nama produk/i.test(field))
-  const variantGuess = headers.findIndex(field => /variant name|varian/i.test(field))
-  const idGuess = headers.findIndex(field => /sku|internal id|item id/i.test(field))
   csvInfo = {
-    fileName: csvFile.name, bytes: csvDecoded.bytes, rows: parsedRows.length - 1, columns: width, headers, delimiter,
-    linebreak: parsedCsv.meta.linebreak || (csvText.includes('\r\n') ? '\r\n' : '\n'), bom,
-    trailingNewline: /(?:\r\n|\n|\r)$/.test(csvText), preview: parsedRows.slice(0, 5), warnings: [],
+    format: sourceFormat, fileName: sourceFile.name, bytes: sourceDecoded.bytes, rows: parsedRows.length - 1, columns: parsedRows[0].length, headers: [...parsedRows[0]], delimiter,
+    linebreak, bom, trailingNewline, preview: parsedRows.slice(0, 5), warnings: [], sheetNames: sourceSheetNames, selectedSheet,
   }
   const invalidNames = masterRecords.reduce((count, record) => count + (typeof record[jsonNameGuess] !== 'string' || !(record[jsonNameGuess] as string).trim() ? 1 : 0), 0)
   jsonInfo = { fileName: jsonFile.name, bytes: jsonDecoded.bytes, records: masterRecords.length, fields, invalidNames, preview: masterRecords.slice(0, 3) }
+  sourceRows = parsedRows
+  matchRows = []
+  matchComplete = false
+  const headers = [...parsedRows[0]]
+  const targetGuess = headers.findIndex(field => /items name|nama barang|nama produk/i.test(field))
+  const variantGuess = headers.findIndex(field => /variant name|varian/i.test(field))
+  const idGuess = headers.findIndex(field => /sku|internal id|item id/i.test(field))
+  post('files-loaded', { csv: csvInfo, json: jsonInfo, guesses: { targetIndex: targetGuess, variantIndex: variantGuess >= 0 ? variantGuess : null, identifierIndex: idGuess >= 0 ? idGuess : null, jsonNameField: jsonNameGuess } })
+}
+
+function selectSourceSheet(sheetName: string) {
+  if (sourceFormat !== 'xlsx' || !sourceWorkbook || !sourceSheetNames.includes(sheetName)) return
+  selectedSheet = sheetName
+  sourceRows = parseXlsxSheet(sheetName)
+  if (!csvInfo || !jsonInfo) return
+  matchRows = []
+  matchComplete = false
+  mappings = null
+  csvInfo = { ...csvInfo, selectedSheet, rows: sourceRows.length - 1, columns: sourceRows[0].length, headers: [...sourceRows[0]], preview: sourceRows.slice(0, 5) }
+  const targetGuess = sourceRows[0].findIndex(field => /items name|nama barang|nama produk/i.test(field))
+  const variantGuess = sourceRows[0].findIndex(field => /variant name|varian/i.test(field))
+  const idGuess = sourceRows[0].findIndex(field => /sku|internal id|item id/i.test(field))
+  const jsonNameGuess = jsonInfo.fields.find(field => field.toLowerCase() === 'nama_barang') ?? jsonInfo.fields.find(field => /nama.*barang|product.*name/i.test(field)) ?? ''
   post('files-loaded', { csv: csvInfo, json: jsonInfo, guesses: { targetIndex: targetGuess, variantIndex: variantGuess >= 0 ? variantGuess : null, identifierIndex: idGuess >= 0 ? idGuess : null, jsonNameField: jsonNameGuess } })
 }
 
@@ -343,15 +416,37 @@ function summarize() {
 function searchMaster(query: string, rowId: string) {
   if (!mappings || !query.trim()) { post('search-results', { rowId, results: [] }); return }
   const normalizedQuery = normalize(query)
-  const found = masterRecords.map((record, index) => ({ record, index, name: masterName(record, mappings!.jsonNameField) }))
-    .filter(item => item.name && normalize(item.name).includes(normalizedQuery))
+  const usedNames = new Set(matchRows
+    .filter(row => row.id !== rowId && row.decision === 'use-json')
+    .map(row => normalize(row.finalName)))
+  const grouped = new Map<string, Candidate>()
+  masterRecords.map((record, index) => ({ record, index, name: masterName(record, mappings!.jsonNameField) }))
+    .filter(item => item.name && normalize(item.name).includes(normalizedQuery) && !usedNames.has(normalize(item.name)))
     .map(item => ({ ...item, score: similarity(query, item.name) }))
     .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name, 'id'))
-    .slice(0, 30)
-    .map(item => ({ id: recordRef(item.record, item.index), name: item.name, refs: [recordRef(item.record, item.index)], score: item.score, reason: 'Dipilih dari pencarian seluruh master.' }))
+    .forEach(item => {
+      const nameKey = normalize(item.name)
+      const reference = recordRef(item.record, item.index)
+      const existing = grouped.get(nameKey)
+      if (existing) {
+        if (!existing.refs.includes(reference)) existing.refs.push(reference)
+      } else {
+        grouped.set(nameKey, { id: reference, name: item.name, refs: [reference], score: item.score, reason: 'Dipilih dari pencarian seluruh master.' })
+      }
+    })
   const row = matchRows.find(item => item.id === rowId)
+  const found = [...grouped.values()].slice(0, 30).map(candidate => {
+    const existing = row?.candidates.find(item => normalize(item.name) === normalize(candidate.name))
+    return existing
+      ? { ...candidate, id: existing.id, refs: [...new Set([...existing.refs, ...candidate.refs])] }
+      : candidate
+  })
   if (row) {
-    for (const candidate of found) if (!row.candidates.some(existing => existing.id === candidate.id)) row.candidates.push(candidate)
+    for (const candidate of found) {
+      const existing = row.candidates.find(item => item.id === candidate.id)
+      if (existing) existing.refs = [...new Set([...existing.refs, ...candidate.refs])]
+      else row.candidates.push(candidate)
+    }
   }
   post('search-results', { rowId, results: found })
 }
@@ -389,38 +484,90 @@ function serialize(rows: string[][], delimiter: string, newline: string, trailin
 
 function exportFiles() {
   if (!csvInfo || !mappings || !matchComplete) throw new Error('Hasil pencocokan belum selesai. Proses yang dibatalkan atau gagal tidak dapat diekspor.')
-  const outputRows = sourceRows.map(row => [...row])
-  for (const result of matchRows) if (result.decision === 'use-json') outputRows[result.sourceIndex + 1][mappings.targetIndex] = result.finalName
-  const outputTextNoBom = serialize(outputRows, csvInfo.delimiter, csvInfo.linebreak, csvInfo.trailingNewline)
-  const reparsed = Papa.parse<string[]>(outputTextNoBom, { delimiter: csvInfo.delimiter, header: false, dynamicTyping: false, skipEmptyLines: false })
-  if (reparsed.errors.length || reparsed.data.length !== sourceRows.length) throw new Error('Validasi ekspor gagal: jumlah record berubah. Tidak ada file yang diunduh.')
-  for (let r = 0; r < sourceRows.length; r += 1) {
-    if (reparsed.data[r].length !== sourceRows[r].length) throw new Error(`Validasi ekspor gagal pada record ${r + 1}: jumlah kolom berubah.`)
-    for (let c = 0; c < sourceRows[r].length; c += 1) {
-      const expected = c === mappings.targetIndex && r > 0 ? (matchRows[r - 1].decision === 'use-json' ? matchRows[r - 1].finalName : sourceRows[r][c]) : sourceRows[r][c]
-      if (reparsed.data[r][c] !== expected) throw new Error(`Validasi ekspor gagal pada record ${r + 1}, kolom ${c + 1}. Tidak ada file yang diunduh.`)
+  const includedRows = matchRows.filter(row => row.status === 'certain').sort((a, b) => a.sourceIndex - b.sourceIndex)
+  const outputRows = [
+    [...sourceRows[0]],
+    ...includedRows.map(result => {
+      const row = [...sourceRows[result.sourceIndex + 1]]
+      if (result.decision === 'use-json') row[mappings!.targetIndex] = result.finalName
+      return row
+    }),
+  ]
+  let mainContent: string | Blob
+  let fileName: string
+  if (csvInfo.format === 'xlsx') {
+    if (!csvInfo.selectedSheet) throw new Error('Sheet XLSX yang dipilih tidak tersedia. Pilih kembali sheet sumber sebelum ekspor.')
+    const reparsed = outputRows.map(row => [...row])
+    if (reparsed.length !== includedRows.length + 1 || reparsed.some(row => row.length !== sourceRows[0].length)) throw new Error('Validasi ekspor gagal: struktur XLSX berubah. Tidak ada file yang diunduh.')
+    reparsed.forEach((row, rowIndex) => {
+      const sourceRow = rowIndex === 0 ? sourceRows[0] : sourceRows[includedRows[rowIndex - 1].sourceIndex + 1]
+      for (let column = 0; column < row.length; column += 1) {
+        const expected = column === mappings!.targetIndex && rowIndex > 0 && includedRows[rowIndex - 1].decision === 'use-json' ? includedRows[rowIndex - 1].finalName : sourceRow[column]
+        if (row[column] !== expected) throw new Error(`Validasi ekspor gagal pada record terpilih ${rowIndex + 1}, kolom ${column + 1}. Tidak ada file yang diunduh.`)
+      }
+    })
+    const workbook = XLSX.utils.book_new()
+    const worksheet = XLSX.utils.aoa_to_sheet(outputRows)
+    XLSX.utils.book_append_sheet(workbook, worksheet, csvInfo.selectedSheet)
+    const bytes = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' })
+    const verifiedWorkbook = XLSX.read(bytes, { type: 'array', cellDates: false })
+    const verifiedSheet = verifiedWorkbook.Sheets[csvInfo.selectedSheet]
+    if (!verifiedSheet) throw new Error('Validasi ekspor gagal: sheet hasil tidak ditemukan. Tidak ada file yang diunduh.')
+    const verifiedRows = XLSX.utils.sheet_to_json<unknown[]>(verifiedSheet, { header: 1, raw: false, defval: '', blankrows: true })
+    if (verifiedRows.length !== outputRows.length) throw new Error('Validasi ekspor gagal: jumlah baris XLSX berubah. Tidak ada file yang diunduh.')
+    for (let rowIndex = 0; rowIndex < outputRows.length; rowIndex += 1) {
+      if (verifiedRows[rowIndex].length !== outputRows[rowIndex].length) throw new Error(`Validasi ekspor gagal pada record XLSX ${rowIndex + 1}: jumlah kolom berubah.`)
+      for (let column = 0; column < outputRows[rowIndex].length; column += 1) {
+        const value = verifiedRows[rowIndex][column] == null ? '' : String(verifiedRows[rowIndex][column])
+        if (value !== outputRows[rowIndex][column]) throw new Error(`Validasi ekspor gagal pada record XLSX ${rowIndex + 1}, kolom ${column + 1}. Tidak ada file yang diunduh.`)
+      }
     }
+    const copy = new Uint8Array(bytes)
+    mainContent = new Blob([copy.buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+    fileName = `${csvInfo.fileName.replace(/\.xlsx$/i, '')}_cocok_pasti.xlsx`
+  } else {
+    const outputTextNoBom = serialize(outputRows, csvInfo.delimiter, csvInfo.linebreak, csvInfo.trailingNewline)
+    const reparsed = Papa.parse<string[]>(outputTextNoBom, { delimiter: csvInfo.delimiter, header: false, dynamicTyping: false, skipEmptyLines: false })
+    const validatedRows = [...reparsed.data]
+    if (csvInfo.trailingNewline && validatedRows.at(-1)?.every(value => value === '')) validatedRows.pop()
+    if (reparsed.errors.length || validatedRows.length !== outputRows.length) throw new Error('Validasi ekspor gagal: jumlah record berubah. Tidak ada file yang diunduh.')
+    for (let r = 0; r < outputRows.length; r += 1) {
+      if (validatedRows[r].length !== outputRows[r].length) throw new Error(`Validasi ekspor gagal pada record ${r + 1}: jumlah kolom berubah.`)
+      for (let c = 0; c < outputRows[r].length; c += 1) {
+        if (validatedRows[r][c] !== outputRows[r][c]) throw new Error(`Validasi ekspor gagal pada record ${r + 1}, kolom ${c + 1}. Tidak ada file yang diunduh.`)
+      }
+    }
+    mainContent = (csvInfo.bom ? '\uFEFF' : '') + outputTextNoBom
+    fileName = `${csvInfo.fileName.replace(/\.csv$/i, '')}_cocok_pasti.csv`
   }
-  const csvText = (csvInfo.bom ? '\uFEFF' : '') + outputTextNoBom
   const reportHeaders = ['Nomor record sumber', 'ID atau SKU', 'Nama CSV', 'Varian CSV', 'Referensi JSON', 'Kandidat', 'Skor', 'Metode', 'Alasan', 'Keputusan', 'Nama akhir']
   const report = [reportHeaders, ...matchRows.map(row => {
     const reportCandidate = row.candidates.find(c => c.id === row.chosenId) ?? row.candidates[0]
     return [String(row.sourceIndex + 2), row.identifier, row.sourceName, row.variant, reportCandidate?.refs.join('; ') ?? '', reportCandidate?.name ?? '', String(reportCandidate?.score ?? ''), row.status === 'certain' ? 'Nama tepat' : row.status === 'review' ? 'Fuzzy / tinjauan' : 'Tidak cocok', row.reason, row.decision === 'use-json' ? 'Gunakan JSON' : row.decision === 'keep-csv' ? 'Pertahankan CSV' : 'Belum dipilih', row.finalName]
   })]
   const reportText = serialize(report, ',', '\r\n', false)
-  post('export-ready', { csv: csvText, report: reportText, fileName: `${csvInfo.fileName.replace(/\.csv$/i, '')}_nama_disamakan.csv`, reportName: `${csvInfo.fileName.replace(/\.csv$/i, '')}_laporan_pencocokan.csv`, summary: summarize() })
+  const exportSummary = {
+    included: includedRows.length,
+    changed: includedRows.filter(row => row.decision === 'use-json' && row.finalName !== row.sourceName).length,
+    same: includedRows.filter(row => row.decision === 'use-json' && row.finalName === row.sourceName).length,
+    kept: includedRows.filter(row => row.decision !== 'use-json').length,
+    excluded: matchRows.length - includedRows.length,
+  }
+  const reportName = `${csvInfo.fileName.replace(/\.(csv|xlsx)$/i, '')}_laporan_pencocokan.csv`
+  post('export-ready', { mainContent, mainMime: csvInfo.format === 'xlsx' ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' : 'text/csv;charset=utf-8', report: reportText, fileName, reportName, summary: summarize(), exportSummary })
 }
 
 self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
   const message = event.data
   try {
-    if (message.type === 'load-files') await loadFiles(message.csv, message.json)
+    if (message.type === 'load-files') await loadFiles(message.source, message.json)
+    if (message.type === 'select-sheet') selectSourceSheet(message.sheetName)
     if (message.type === 'match') await runMatch({ targetIndex: message.targetIndex, variantIndex: message.variantIndex, jsonNameField: message.jsonNameField, identifierIndex: message.identifierIndex })
     if (message.type === 'search') searchMaster(message.query, message.rowId)
     if (message.type === 'decide') decide(message.rowId, message.decision, message.candidateId)
     if (message.type === 'export') exportFiles()
     if (message.type === 'cancel') { canceled = true; matchComplete = false; post('canceled') }
-    if (message.type === 'reset') { sourceRows = []; masterRecords = []; csvInfo = null; jsonInfo = null; matchRows = []; mappings = null; matchComplete = false; canceled = true; post('reset') }
+    if (message.type === 'reset') { sourceRows = []; masterRecords = []; sourceWorkbook = null; sourceSheetNames = []; selectedSheet = ''; csvInfo = null; jsonInfo = null; matchRows = []; mappings = null; matchComplete = false; canceled = true; post('reset') }
   } catch (error) {
     post('error', { message: error instanceof Error ? error.message : 'Terjadi kesalahan saat memproses file.' })
   }
