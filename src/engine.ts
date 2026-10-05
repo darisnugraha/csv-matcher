@@ -659,6 +659,60 @@ function exportFiles() {
     mainContent = (csvInfo.bom ? '\uFEFF' : '') + outputTextNoBom
     fileName = `${csvInfo.fileName.replace(/\.csv$/i, '')}_cocok_pasti.csv`
   }
+  const reviewUnmatchedRows = matchRows
+    .filter(row => row.status === 'review' || row.status === 'unmatched')
+    .sort((a, b) => a.sourceIndex - b.sourceIndex)
+  let reviewUnmatchedContent: string | Blob | null = null
+  let reviewUnmatchedName: string
+  const reviewUnmatchedMime = csvInfo.format === 'xlsx'
+    ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    : 'text/csv;charset=utf-8'
+  if (csvInfo.format === 'xlsx') {
+    reviewUnmatchedName = `${csvInfo.fileName.replace(/\.xlsx$/i, '')}_perlu_tinjau_belum_cocok.xlsx`
+    if (reviewUnmatchedRows.length > 0) {
+      if (!csvInfo.selectedSheet) throw new Error('Sheet XLSX yang dipilih tidak tersedia. Pilih kembali sheet sumber sebelum ekspor.')
+      const reviewRows = [
+        [...sourceRows[0]],
+        ...reviewUnmatchedRows.map(result => [...sourceRows[result.sourceIndex + 1]]),
+      ]
+      const workbook = XLSX.utils.book_new()
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(reviewRows), csvInfo.selectedSheet)
+      const bytes = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' })
+      const verifiedWorkbook = XLSX.read(bytes, { type: 'array', cellDates: false })
+      const verifiedSheet = verifiedWorkbook.Sheets[csvInfo.selectedSheet]
+      if (!verifiedSheet) throw new Error('Validasi ekspor tinjau gagal: sheet hasil tidak ditemukan. Tidak ada file yang diunduh.')
+      const verifiedRows = XLSX.utils.sheet_to_json<unknown[]>(verifiedSheet, { header: 1, raw: false, defval: '', blankrows: true })
+      if (verifiedRows.length !== reviewRows.length) throw new Error('Validasi ekspor tinjau gagal: jumlah baris XLSX berubah. Tidak ada file yang diunduh.')
+      for (let rowIndex = 0; rowIndex < reviewRows.length; rowIndex += 1) {
+        if (verifiedRows[rowIndex].length !== reviewRows[rowIndex].length) throw new Error(`Validasi ekspor tinjau gagal pada record XLSX ${rowIndex + 1}: jumlah kolom berubah.`)
+        for (let column = 0; column < reviewRows[rowIndex].length; column += 1) {
+          const value = verifiedRows[rowIndex][column] == null ? '' : String(verifiedRows[rowIndex][column])
+          if (value !== reviewRows[rowIndex][column]) throw new Error(`Validasi ekspor tinjau gagal pada record XLSX ${rowIndex + 1}, kolom ${column + 1}. Tidak ada file yang diunduh.`)
+        }
+      }
+      reviewUnmatchedContent = new Blob([new Uint8Array(bytes).buffer], { type: reviewUnmatchedMime })
+    }
+  } else {
+    reviewUnmatchedName = `${csvInfo.fileName.replace(/\.csv$/i, '')}_perlu_tinjau_belum_cocok.csv`
+    if (reviewUnmatchedRows.length > 0) {
+      const reviewRows = [
+        [...sourceRows[0]],
+        ...reviewUnmatchedRows.map(result => [...sourceRows[result.sourceIndex + 1]]),
+      ]
+      const reviewTextNoBom = serialize(reviewRows, csvInfo.delimiter, csvInfo.linebreak, csvInfo.trailingNewline)
+      const reparsed = Papa.parse<string[]>(reviewTextNoBom, { delimiter: csvInfo.delimiter, header: false, dynamicTyping: false, skipEmptyLines: false })
+      const verifiedRows = [...reparsed.data]
+      if (csvInfo.trailingNewline && verifiedRows.at(-1)?.every(value => value === '')) verifiedRows.pop()
+      if (reparsed.errors.length || verifiedRows.length !== reviewRows.length) throw new Error('Validasi ekspor tinjau gagal: jumlah record berubah. Tidak ada file yang diunduh.')
+      for (let rowIndex = 0; rowIndex < reviewRows.length; rowIndex += 1) {
+        if (verifiedRows[rowIndex].length !== reviewRows[rowIndex].length) throw new Error(`Validasi ekspor tinjau gagal pada record ${rowIndex + 1}: jumlah kolom berubah.`)
+        for (let column = 0; column < reviewRows[rowIndex].length; column += 1) {
+          if (verifiedRows[rowIndex][column] !== reviewRows[rowIndex][column]) throw new Error(`Validasi ekspor tinjau gagal pada record ${rowIndex + 1}, kolom ${column + 1}. Tidak ada file yang diunduh.`)
+        }
+      }
+      reviewUnmatchedContent = (csvInfo.bom ? '\uFEFF' : '') + reviewTextNoBom
+    }
+  }
   const reportHeaders = ['Nomor record sumber', 'ID atau SKU', 'Merek CSV', 'Nama CSV', 'Varian CSV', 'Referensi JSON', 'Kandidat', 'Skor', 'Metode', 'Alasan', 'Keputusan', 'Nama akhir']
   const report = [reportHeaders, ...matchRows.map(row => {
     const reportCandidate = row.candidates.find(c => c.id === row.chosenId) ?? row.candidates[0]
@@ -673,7 +727,7 @@ function exportFiles() {
     excluded: matchRows.length - includedRows.length,
   }
   const reportName = `${csvInfo.fileName.replace(/\.(csv|xlsx)$/i, '')}_laporan_pencocokan.csv`
-  post('export-ready', { mainContent, mainMime: csvInfo.format === 'xlsx' ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' : 'text/csv;charset=utf-8', report: reportText, fileName, reportName, summary: summarize(), exportSummary })
+  post('export-ready', { mainContent, mainMime: csvInfo.format === 'xlsx' ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' : 'text/csv;charset=utf-8', fileName, reviewUnmatchedContent, reviewUnmatchedMime, reviewUnmatchedName, reviewUnmatchedCount: reviewUnmatchedRows.length, report: reportText, reportName, summary: summarize(), exportSummary })
 }
 
 self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
