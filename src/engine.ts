@@ -308,18 +308,14 @@ async function runMatch(config: NonNullable<typeof mappings>) {
       matchRows.push({ id, sourceIndex: index, sourceName, variant, identifier, status: 'unmatched', reason: 'Nama CSV kosong; baris dipertahankan.', candidates: [], decision: 'pending', finalName: sourceName })
     } else {
       const found = candidatesFor(sourceName, variant, config.jsonNameField, tokenIndex).filter(candidate => candidate.score >= 80)
-      const expected = normalize([sourceName, variant].filter(Boolean).join(' - '))
-      const exact = found.filter(item => normalize(item.name) === expected)
-      const approvedPrefixes = ['OXVA'] // Explicit, versioned brand-prefix allowlist (normalization v1).
-      const prefixMatches = found.filter(item => {
-        const candidateName = normalize(item.name)
-        return approvedPrefixes.some(prefix => candidateName.startsWith(`${prefix} `) && candidateName.slice(prefix.length + 1) === expected)
-      })
-      const safeExact = exact.filter(item => !item.specConflict)
-      const automaticCandidates = safeExact.length ? safeExact : prefixMatches.filter(item => !item.specConflict)
-      const automatic = automaticCandidates.length === 1
-      const selectedCandidate = automaticCandidates[0]
-      const reason = automatic ? (safeExact.length ? 'Nama dan varian cocok setelah normalisasi.' : 'Awalan merek OXVA terdaftar; nama produk dan spesifikasi cocok.') : found.length ? found[0].reason : 'Kandidat tidak ditemukan. Cari nama di seluruh master.'
+      const perfectCandidates = found.filter(candidate => candidate.score === 100)
+      const automatic = perfectCandidates.length === 1
+      const selectedCandidate = automatic ? perfectCandidates[0] : undefined
+      const reason = automatic
+        ? selectedCandidate?.specConflict
+          ? 'Skor kemiripan 100%; dipilih otomatis. Metadata menunjukkan konflik spesifikasi.'
+          : 'Skor kemiripan 100%; satu nama target unik dipilih otomatis.'
+        : found.length ? found[0].reason : 'Kandidat tidak ditemukan. Cari nama di seluruh master.'
       matchRows.push({ id, sourceIndex: index, sourceName, variant, identifier, status: automatic ? 'certain' : found.length ? 'review' : 'unmatched', reason, candidates: found, decision: automatic ? 'use-json' : 'pending', chosenId: selectedCandidate?.id, finalName: selectedCandidate?.name ?? sourceName })
     }
     if (index % 250 === 0 || index === rows.length - 1) {
